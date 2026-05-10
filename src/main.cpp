@@ -38,6 +38,27 @@ const uint8_t MOTOR_RIGHT_PWM_CHANNEL = 1;
 const uint8_t LINE_SENSOR_PIN = 23;
 const uint8_t LINE_SENSOR_ACTIVE_STATE = HIGH;
 
+// Sumo behavior tuning. Motor values are signed: +forward, -reverse, 0 stop.
+const unsigned long START_DELAY_MS = 5000;
+const unsigned long START_DELAY_BLINK_MS = 1000;
+const unsigned long ESCAPE_BACKUP_MS = 260;
+const unsigned long ESCAPE_TURN_MS = 360;
+const bool ENABLE_LINE_DETECTION = false;
+const uint16_t MAX_VISIBLE_OPPONENT_MM = 500;
+const uint16_t measureDistanceMin = MAX_VISIBLE_OPPONENT_MM;
+constexpr int16_t speedPercent(uint8_t percent)
+{
+  return static_cast<int16_t>((static_cast<uint16_t>(percent) * 255) / 100);
+}
+
+const int16_t SPEED_STOP = 0;
+const int16_t SPEED_ATTACK = speedPercent(10);
+const int16_t SPEED_ATTACK_CORRECT_INSIDE = speedPercent(4);
+const int16_t SPEED_ALIGN_TURN = speedPercent(4);
+const int16_t SPEED_SEARCH_TURN = speedPercent(4);
+const int16_t SPEED_ESCAPE_BACKUP = speedPercent(6);
+const int16_t SPEED_ESCAPE_TURN = speedPercent(4);
+
 Adafruit_NeoPixel ws2812b(WS2812B_LED_COUNT, WS2812B_PIN, NEO_BRG + NEO_KHZ800);
 Adafruit_VL53L0X sensorRight;
 Adafruit_VL53L0X sensorFront;
@@ -60,6 +81,33 @@ bool sensorRightReady = false;
 bool sensorFrontReady = false;
 bool sensorLeftReady = false;
 
+enum class RobotMode
+{
+  WaitingForStart,
+  StartDelay,
+  Running
+};
+
+enum class EscapePhase
+{
+  None,
+  BackingUp,
+  TurningInside
+};
+
+enum class MoveDirection
+{
+  Left,
+  Right
+};
+
+RobotMode robotMode = RobotMode::WaitingForStart;
+EscapePhase escapePhase = EscapePhase::None;
+MoveDirection moveDirection = MoveDirection::Left;
+unsigned long robotModeStartedMs = 0;
+unsigned long escapePhaseStartedMs = 0;
+bool escapeTurnLeft = true;
+
 void setupWiFi();
 void setupWebOTA();
 void addLog(const String &message);
@@ -75,15 +123,29 @@ void setupDistanceSensors();
 bool setupDistanceSensor(Adafruit_VL53L0X &sensor, const String &name, uint8_t xshutPin, uint8_t address);
 void logDistanceSensors();
 String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready);
+bool readDistanceMillimeters(Adafruit_VL53L0X &sensor, bool ready, uint16_t &distanceMm);
 void setupMotors();
 void attachMotorPwm(uint8_t pin, uint8_t channel);
 void writeMotorPwm(uint8_t pin, uint8_t channel, uint8_t duty);
 void setMotorsSpeed(uint8_t duty);
+uint8_t motorSpeedToActiveLowDuty(int16_t speed);
+void setMotorOutputs(int16_t leftSpeed, int16_t rightSpeed);
 void setupLineSensor();
 String readLineSensorStatus();
 void setProjectRunning(bool running);
 void setupProject();
 void loopProject();
+void waitForStart();
+bool checkArenaBoundary();
+void attackOpponent();
+void searchForOpponent();
+void moveForward(int16_t speed);
+void attackForwardLeft();
+void attackForwardRight();
+void turnLeft(int16_t speed);
+void turnRight(int16_t speed);
+uint16_t measuredDistanceOrMax(Adafruit_VL53L0X &sensor, bool ready);
+bool isLineDetected();
 
 String htmlEscape(const String &text)
 {
@@ -912,9 +974,26 @@ bool setupDistanceSensor(Adafruit_VL53L0X &sensor, const String &name, uint8_t x
 
 String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready)
 {
+  uint16_t distanceMm = 0;
+
+  if (readDistanceMillimeters(sensor, ready, distanceMm))
+  {
+    return String(distanceMm) + " mm";
+  }
+
   if (!ready)
   {
     return "not ready";
+  }
+
+  return "out of range";
+}
+
+bool readDistanceMillimeters(Adafruit_VL53L0X &sensor, bool ready, uint16_t &distanceMm)
+{
+  if (!ready)
+  {
+    return false;
   }
 
   VL53L0X_RangingMeasurementData_t measurement;
@@ -922,10 +1001,11 @@ String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready)
 
   if (measurement.RangeStatus == 4)
   {
-    return "out of range";
+    return false;
   }
 
-  return String(measurement.RangeMilliMeter) + " mm";
+  distanceMm = measurement.RangeMilliMeter;
+  return true;
 }
 
 void logDistanceSensors()
@@ -979,10 +1059,31 @@ void writeMotorPwm(uint8_t pin, uint8_t channel, uint8_t duty)
 
 void setMotorsSpeed(uint8_t duty)
 {
-  const uint8_t invertedDuty = MOTOR_STOP_DUTY - duty;
+  const uint8_t invertedDuty = motorSpeedToActiveLowDuty(duty);
 
   writeMotorPwm(MOTOR_LEFT_PWM_PIN, MOTOR_LEFT_PWM_CHANNEL, invertedDuty);
   writeMotorPwm(MOTOR_RIGHT_PWM_PIN, MOTOR_RIGHT_PWM_CHANNEL, invertedDuty);
+}
+
+uint8_t motorSpeedToActiveLowDuty(int16_t speed)
+{
+  // Motor PWM is inverted: 255 means stopped, 0 means maximum power.
+  const int16_t safeSpeed = constrain(abs(speed), 0, 255);
+  return MOTOR_STOP_DUTY - safeSpeed;
+}
+
+void setMotorOutputs(int16_t leftSpeed, int16_t rightSpeed)
+{
+  leftSpeed = constrain(leftSpeed, -255, 255);
+  rightSpeed = constrain(rightSpeed, -255, 255);
+
+  // Direction HIGH is treated as forward because that is how the original
+  // motor test code drove the robot. Reverse is used for boundary escape.
+  digitalWrite(MOTOR_LEFT_DIR_PIN, leftSpeed >= 0 ? HIGH : LOW);
+  digitalWrite(MOTOR_RIGHT_DIR_PIN, rightSpeed >= 0 ? HIGH : LOW);
+
+  writeMotorPwm(MOTOR_LEFT_PWM_PIN, MOTOR_LEFT_PWM_CHANNEL, motorSpeedToActiveLowDuty(leftSpeed));
+  writeMotorPwm(MOTOR_RIGHT_PWM_PIN, MOTOR_RIGHT_PWM_CHANNEL, motorSpeedToActiveLowDuty(rightSpeed));
 }
 
 void setupLineSensor()
@@ -1008,19 +1109,15 @@ void setProjectRunning(bool running)
   if (projectRunning)
   {
     setWs2812bColor(255, 0, 0);
-    digitalWrite(MOTOR_LEFT_DIR_PIN, HIGH);
-    digitalWrite(MOTOR_RIGHT_DIR_PIN, HIGH);
-    setMotorsSpeed(MOTOR_RUN_DUTY);
+    setMotorOutputs(SPEED_STOP, SPEED_STOP);
     lastSensorLogMs = 0;
     addLog("Project status: running");
     addLog("WS2812B color: red");
-    addLog("Motors speed: 10% active-low PWM");
+    addLog("Sumo algorithm active");
   }
   else
   {
-    setMotorsSpeed(0);
-    digitalWrite(MOTOR_LEFT_DIR_PIN, LOW);
-    digitalWrite(MOTOR_RIGHT_DIR_PIN, LOW);
+    setMotorOutputs(SPEED_STOP, SPEED_STOP);
     setWs2812bColor(0, 255, 0);
     addLog("Project status: stopped");
     addLog("WS2812B color: green");
@@ -1049,32 +1146,236 @@ void setupProject()
 
 void loopProject()
 {
+  waitForStart();
+
+  if (!projectRunning)
+  {
+    return;
+  }
+
+  // The boundary check always wins. It may take over the motors for a short
+  // non-blocking escape sequence before normal attack/search resumes.
+  if (checkArenaBoundary())
+  {
+    return;
+  }
+
+  attackOpponent();
+
+  if (lastSensorLogMs == 0 || millis() - lastSensorLogMs >= SENSOR_LOG_INTERVAL_MS)
+  {
+    lastSensorLogMs = millis();
+    logDistanceSensors();
+  }
+}
+
+void waitForStart()
+{
+  const unsigned long now = millis();
   const bool currentReading = digitalRead(BTN_RUN_PIN);
 
   if (currentReading != lastRunButtonReading)
   {
-    lastRunButtonChangeMs = millis();
+    lastRunButtonChangeMs = now;
     lastRunButtonReading = currentReading;
   }
 
-  if ((millis() - lastRunButtonChangeMs) > BUTTON_DEBOUNCE_MS && currentReading != stableRunButtonState)
+  if ((now - lastRunButtonChangeMs) > BUTTON_DEBOUNCE_MS && currentReading != stableRunButtonState)
   {
     stableRunButtonState = currentReading;
 
     if (stableRunButtonState == HIGH)
     {
-      addLog("BTN_RUN_PIN released");
-      setProjectRunning(!projectRunning);
+      if (robotMode == RobotMode::WaitingForStart)
+      {
+        robotMode = RobotMode::StartDelay;
+        robotModeStartedMs = now;
+        setWs2812bColor(255, 0, 0);
+        setMotorOutputs(SPEED_STOP, SPEED_STOP);
+        addLog("START released; waiting 5 seconds before sumo algorithm");
+      }
+      else
+      {
+        robotMode = RobotMode::WaitingForStart;
+        escapePhase = EscapePhase::None;
+        setProjectRunning(false);
+        addLog("START released; sumo algorithm stopped");
+      }
     }
   }
 
-  if (projectRunning && (lastSensorLogMs == 0 || millis() - lastSensorLogMs >= SENSOR_LOG_INTERVAL_MS))
+  if (robotMode == RobotMode::StartDelay)
   {
-    lastSensorLogMs = millis();
-    logDistanceSensors();
+    const unsigned long delayElapsedMs = now - robotModeStartedMs;
+
+    if (delayElapsedMs >= START_DELAY_MS)
+    {
+      robotMode = RobotMode::Running;
+      escapePhase = EscapePhase::None;
+      moveDirection = MoveDirection::Left;
+      setProjectRunning(true);
+      addLog("Start delay complete; entering sumo mode");
+    }
+    else if ((delayElapsedMs / START_DELAY_BLINK_MS) % 2 == 0)
+    {
+      setWs2812bColor(255, 0, 0);
+    }
+    else
+    {
+      setWs2812bColor(0, 255, 0);
+    }
+  }
+}
+
+bool checkArenaBoundary()
+{
+  if (!ENABLE_LINE_DETECTION)
+  {
+    return false;
   }
 
-  // Add your own repeated project logic here.
+  const unsigned long now = millis();
+
+  if (isLineDetected() && escapePhase == EscapePhase::None)
+  {
+    escapePhase = EscapePhase::BackingUp;
+    escapePhaseStartedMs = now;
+    escapeTurnLeft = !escapeTurnLeft;
+    setMotorOutputs(-SPEED_ESCAPE_BACKUP, -SPEED_ESCAPE_BACKUP);
+    addLog("Arena boundary detected; backing up");
+    return true;
+  }
+
+  if (escapePhase == EscapePhase::BackingUp)
+  {
+    setMotorOutputs(-SPEED_ESCAPE_BACKUP, -SPEED_ESCAPE_BACKUP);
+
+    if (now - escapePhaseStartedMs >= ESCAPE_BACKUP_MS)
+    {
+      escapePhase = EscapePhase::TurningInside;
+      escapePhaseStartedMs = now;
+      addLog("Boundary escape: turning back inside");
+    }
+
+    return true;
+  }
+
+  if (escapePhase == EscapePhase::TurningInside)
+  {
+    if (escapeTurnLeft)
+    {
+      setMotorOutputs(-SPEED_ESCAPE_TURN, SPEED_ESCAPE_TURN);
+    }
+    else
+    {
+      setMotorOutputs(SPEED_ESCAPE_TURN, -SPEED_ESCAPE_TURN);
+    }
+
+    if (now - escapePhaseStartedMs >= ESCAPE_TURN_MS && !isLineDetected())
+    {
+      escapePhase = EscapePhase::None;
+      moveDirection = MoveDirection::Left;
+      addLog("Boundary escape complete");
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+void attackOpponent()
+{
+  const uint16_t measuredFront = measuredDistanceOrMax(sensorFront, sensorFrontReady);
+  const uint16_t measuredLeft = measuredDistanceOrMax(sensorLeft, sensorLeftReady);
+  const uint16_t measuredRight = measuredDistanceOrMax(sensorRight, sensorRightReady);
+  const bool frontDetected = measuredFront < measureDistanceMin;
+  const bool leftDetected = measuredLeft < measureDistanceMin;
+  const bool rightDetected = measuredRight < measureDistanceMin;
+
+  if (frontDetected && leftDetected)
+  {
+    attackForwardLeft();
+    moveDirection = MoveDirection::Left;
+    return;
+  }
+
+  if (frontDetected && rightDetected)
+  {
+    attackForwardRight();
+    moveDirection = MoveDirection::Right;
+    return;
+  }
+
+  if (frontDetected)
+  {
+    moveForward(SPEED_ATTACK);
+    return;
+  }
+
+  if (leftDetected)
+  {
+    turnLeft(SPEED_ALIGN_TURN);
+    moveDirection = MoveDirection::Left;
+    return;
+  }
+
+  if (rightDetected)
+  {
+    turnRight(SPEED_ALIGN_TURN);
+    moveDirection = MoveDirection::Right;
+    return;
+  }
+
+  searchForOpponent();
+}
+
+void searchForOpponent()
+{
+  if (moveDirection == MoveDirection::Left)
+  {
+    turnLeft(SPEED_SEARCH_TURN);
+  }
+  else
+  {
+    turnRight(SPEED_SEARCH_TURN);
+  }
+}
+
+void moveForward(int16_t speed)
+{
+  setMotorOutputs(speed, speed);
+}
+
+void attackForwardLeft()
+{
+  setMotorOutputs(SPEED_ATTACK_CORRECT_INSIDE, SPEED_ATTACK);
+}
+
+void attackForwardRight()
+{
+  setMotorOutputs(SPEED_ATTACK, SPEED_ATTACK_CORRECT_INSIDE);
+}
+
+void turnLeft(int16_t speed)
+{
+  setMotorOutputs(-speed, speed);
+}
+
+void turnRight(int16_t speed)
+{
+  setMotorOutputs(speed, -speed);
+}
+
+uint16_t measuredDistanceOrMax(Adafruit_VL53L0X &sensor, bool ready)
+{
+  uint16_t distanceMm = 0;
+  return readDistanceMillimeters(sensor, ready, distanceMm) ? distanceMm : UINT16_MAX;
+}
+
+bool isLineDetected()
+{
+  return digitalRead(LINE_SENSOR_PIN) == LINE_SENSOR_ACTIVE_STATE;
 }
 
 void setup()
