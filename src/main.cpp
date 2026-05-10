@@ -31,12 +31,22 @@ const uint8_t MOTOR_LEFT_PWM_PIN = 17;
 const uint8_t MOTOR_LEFT_DIR_PIN = 16;
 const uint8_t MOTOR_RIGHT_PWM_PIN = 19;
 const uint8_t MOTOR_RIGHT_DIR_PIN = 18;
+const uint8_t MOTOR_LEFT_FORWARD_STATE = LOW;
+const uint8_t MOTOR_RIGHT_FORWARD_STATE = HIGH;
 const uint32_t pwmFreq = 5000;
 const uint8_t pwmResolution = 8;
-uint8_t searchSpeedPercent = 1;
-uint8_t attackSpeedPercent = 10;
 const uint8_t MOTOR_MAX_DUTY = 255;
 const uint8_t MOTOR_STOP_DUTY = 255;
+
+constexpr int16_t speedPercent(uint8_t percent)
+{
+  return (static_cast<int16_t>(percent > 100 ? 100 : percent) * MOTOR_MAX_DUTY) / 100;
+}
+
+const int16_t SPEED_ATTACK = speedPercent(10);
+const int16_t SPEED_SEARCH_TURN = speedPercent(7);
+const uint16_t OPPONENT_DETECT_DISTANCE_MM = 500;
+const uint16_t DISTANCE_INVALID_MM = 8191;
 const uint8_t MOTOR_LEFT_PWM_CHANNEL = 0;
 const uint8_t MOTOR_RIGHT_PWM_CHANNEL = 1;
 const uint8_t LINE_SENSOR_PIN = 23;
@@ -81,13 +91,17 @@ void setWs2812bColor(uint8_t red, uint8_t green, uint8_t blue);
 void setupDistanceSensors();
 bool setupDistanceSensor(Adafruit_VL53L0X &sensor, const String &name, uint8_t xshutPin, uint8_t address);
 void logDistanceSensors();
+uint16_t readDistanceSensorMm(Adafruit_VL53L0X &sensor, bool ready);
 String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready);
 void setupMotors();
 void attachMotorPwm(uint8_t pin, uint8_t channel);
 void writeMotorPwm(uint8_t pin, uint8_t channel, uint8_t duty);
 uint8_t speedPercentToDuty(uint8_t percent);
-void setMotorsSpeed(uint8_t duty);
+void setMotorSpeed(uint8_t pwmPin, uint8_t dirPin, uint8_t channel, uint8_t forwardState, int16_t speed);
+void setMotorSpeeds(int16_t leftSpeed, int16_t rightSpeed);
+void setMotorsSpeed(int16_t duty);
 void setMotorsSpeedPercent(uint8_t percent);
+void runCombatAlgorithm();
 void setupLineSensor();
 String readLineSensorStatus();
 void setProjectRunning(bool running);
@@ -921,11 +935,11 @@ bool setupDistanceSensor(Adafruit_VL53L0X &sensor, const String &name, uint8_t x
   return true;
 }
 
-String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready)
+uint16_t readDistanceSensorMm(Adafruit_VL53L0X &sensor, bool ready)
 {
   if (!ready)
   {
-    return "not ready";
+    return DISTANCE_INVALID_MM;
   }
 
   VL53L0X_RangingMeasurementData_t measurement;
@@ -933,10 +947,27 @@ String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready)
 
   if (measurement.RangeStatus == 4)
   {
+    return DISTANCE_INVALID_MM;
+  }
+
+  return measurement.RangeMilliMeter;
+}
+
+String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready)
+{
+  const uint16_t distanceMm = readDistanceSensorMm(sensor, ready);
+
+  if (!ready)
+  {
+    return "not ready";
+  }
+
+  if (distanceMm == DISTANCE_INVALID_MM)
+  {
     return "out of range";
   }
 
-  return String(measurement.RangeMilliMeter) + " mm";
+  return String(distanceMm) + " mm";
 }
 
 void logDistanceSensors()
@@ -945,7 +976,7 @@ void logDistanceSensors()
   const String frontValue = readDistanceSensor(sensorFront, sensorFrontReady);
   const String leftValue = readDistanceSensor(sensorLeft, sensorLeftReady);
 
-  addLog("VL53L0X distances - right: " + rightValue + ", front: " + frontValue + ", left: " + leftValue);
+  addLog("VL53L0X distances - left: " + leftValue + ", front: " + frontValue + ", right: " + rightValue);
   addLog("Line sensor status: " + readLineSensorStatus());
 }
 
@@ -990,22 +1021,67 @@ void writeMotorPwm(uint8_t pin, uint8_t channel, uint8_t duty)
 
 uint8_t speedPercentToDuty(uint8_t percent)
 {
-  const uint8_t limitedPercent = percent > 100 ? 100 : percent;
-
-  return (static_cast<uint16_t>(limitedPercent) * MOTOR_MAX_DUTY) / 100;
+  return speedPercent(percent);
 }
 
-void setMotorsSpeed(uint8_t duty)
+void setMotorsSpeed(int16_t duty)
 {
-  const uint8_t invertedDuty = MOTOR_STOP_DUTY - duty;
-
-  writeMotorPwm(MOTOR_LEFT_PWM_PIN, MOTOR_LEFT_PWM_CHANNEL, invertedDuty);
-  writeMotorPwm(MOTOR_RIGHT_PWM_PIN, MOTOR_RIGHT_PWM_CHANNEL, invertedDuty);
+  setMotorSpeeds(duty, duty);
 }
 
 void setMotorsSpeedPercent(uint8_t percent)
 {
   setMotorsSpeed(speedPercentToDuty(percent));
+}
+
+void setMotorSpeed(uint8_t pwmPin, uint8_t dirPin, uint8_t channel, uint8_t forwardState, int16_t speed)
+{
+  const int16_t limitedSpeed = speed < -MOTOR_MAX_DUTY ? -MOTOR_MAX_DUTY : speed > MOTOR_MAX_DUTY ? MOTOR_MAX_DUTY
+                                                                                                  : speed;
+  const uint8_t duty = abs(limitedSpeed);
+  const uint8_t invertedDuty = MOTOR_STOP_DUTY - duty;
+  const uint8_t reverseState = forwardState == HIGH ? LOW : HIGH;
+
+  digitalWrite(dirPin, limitedSpeed >= 0 ? forwardState : reverseState);
+  writeMotorPwm(pwmPin, channel, invertedDuty);
+}
+
+void setMotorSpeeds(int16_t leftSpeed, int16_t rightSpeed)
+{
+  setMotorSpeed(MOTOR_LEFT_PWM_PIN, MOTOR_LEFT_DIR_PIN, MOTOR_LEFT_PWM_CHANNEL, MOTOR_LEFT_FORWARD_STATE, leftSpeed);
+  setMotorSpeed(MOTOR_RIGHT_PWM_PIN, MOTOR_RIGHT_DIR_PIN, MOTOR_RIGHT_PWM_CHANNEL, MOTOR_RIGHT_FORWARD_STATE, rightSpeed);
+}
+
+void runCombatAlgorithm()
+{
+  const uint16_t frontDistance = readDistanceSensorMm(sensorFront, sensorFrontReady);
+  const uint16_t leftDistance = readDistanceSensorMm(sensorLeft, sensorLeftReady);
+  const uint16_t rightDistance = readDistanceSensorMm(sensorRight, sensorRightReady);
+
+  const bool frontDetected = frontDistance <= OPPONENT_DETECT_DISTANCE_MM;
+  const bool leftDetected = leftDistance <= OPPONENT_DETECT_DISTANCE_MM;
+  const bool rightDetected = rightDistance <= OPPONENT_DETECT_DISTANCE_MM;
+
+  if (!frontDetected && !leftDetected && !rightDetected)
+  {
+    setMotorSpeeds(-SPEED_SEARCH_TURN, SPEED_SEARCH_TURN);
+    return;
+  }
+
+  const uint16_t smallestDistance = min(frontDistance, min(leftDistance, rightDistance));
+
+  if (frontDistance == smallestDistance)
+  {
+    setMotorSpeeds(SPEED_ATTACK, SPEED_ATTACK);
+  }
+  else if (leftDistance == smallestDistance)
+  {
+    setMotorSpeeds(-SPEED_SEARCH_TURN, SPEED_SEARCH_TURN);
+  }
+  else
+  {
+    setMotorSpeeds(SPEED_SEARCH_TURN, -SPEED_SEARCH_TURN);
+  }
 }
 
 void setupLineSensor()
@@ -1032,13 +1108,11 @@ void setProjectRunning(bool running)
   if (projectRunning)
   {
     setWs2812bColor(255, 0, 0);
-    digitalWrite(MOTOR_LEFT_DIR_PIN, HIGH);
-    digitalWrite(MOTOR_RIGHT_DIR_PIN, HIGH);
-    setMotorsSpeedPercent(searchSpeedPercent);
+    setMotorSpeeds(-SPEED_SEARCH_TURN, SPEED_SEARCH_TURN);
     lastSensorLogMs = 0;
     addLog("Project status: running");
     addLog("WS2812B color: red");
-    addLog("Motors search speed: " + String(searchSpeedPercent) + "% active-low PWM");
+    addLog("Combat algorithm active");
   }
   else
   {
@@ -1149,7 +1223,12 @@ void loopProject()
 
   updateStartSequence();
 
-  if (projectRunning && (lastSensorLogMs == 0 || millis() - lastSensorLogMs >= SENSOR_LOG_INTERVAL_MS))
+  if (projectRunning)
+  {
+    runCombatAlgorithm();
+  }
+
+  if (projectRunning && millis() - lastSensorLogMs >= SENSOR_LOG_INTERVAL_MS)
   {
     lastSensorLogMs = millis();
     logDistanceSensors();
