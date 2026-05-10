@@ -44,8 +44,7 @@ const unsigned long START_DELAY_BLINK_MS = 1000;
 const unsigned long ESCAPE_BACKUP_MS = 260;
 const unsigned long ESCAPE_TURN_MS = 360;
 const bool ENABLE_LINE_DETECTION = false;
-const uint16_t MAX_VISIBLE_OPPONENT_MM = 500;
-const uint16_t measureDistanceMin = MAX_VISIBLE_OPPONENT_MM;
+const uint16_t measureDistanceMin = 100;
 constexpr int16_t speedPercent(uint8_t percent)
 {
   return static_cast<int16_t>((static_cast<uint16_t>(percent) * 255) / 100);
@@ -53,9 +52,9 @@ constexpr int16_t speedPercent(uint8_t percent)
 
 const int16_t SPEED_STOP = 0;
 const int16_t SPEED_ATTACK = speedPercent(10);
-const int16_t SPEED_ATTACK_CORRECT_INSIDE = speedPercent(4);
-const int16_t SPEED_ALIGN_TURN = speedPercent(4);
-const int16_t SPEED_SEARCH_TURN = speedPercent(4);
+const int16_t SPEED_ATTACK_CORRECT_INSIDE = speedPercent(10);
+const int16_t SPEED_ALIGN_TURN = speedPercent(10);
+const int16_t SPEED_SEARCH_TURN = speedPercent(10);
 const int16_t SPEED_ESCAPE_BACKUP = speedPercent(6);
 const int16_t SPEED_ESCAPE_TURN = speedPercent(4);
 
@@ -1289,45 +1288,51 @@ void attackOpponent()
   const uint16_t measuredFront = measuredDistanceOrMax(sensorFront, sensorFrontReady);
   const uint16_t measuredLeft = measuredDistanceOrMax(sensorLeft, sensorLeftReady);
   const uint16_t measuredRight = measuredDistanceOrMax(sensorRight, sensorRightReady);
-  const bool frontDetected = measuredFront < measureDistanceMin;
-  const bool leftDetected = measuredLeft < measureDistanceMin;
-  const bool rightDetected = measuredRight < measureDistanceMin;
+  const uint16_t closestDistance = min(measuredFront, min(measuredLeft, measuredRight));
 
-  if (frontDetected && leftDetected)
+  if (closestDistance >= measureDistanceMin)
   {
-    attackForwardLeft();
-    moveDirection = MoveDirection::Left;
+    searchForOpponent();
     return;
   }
 
-  if (frontDetected && rightDetected)
-  {
-    attackForwardRight();
-    moveDirection = MoveDirection::Right;
-    return;
-  }
-
-  if (frontDetected)
+  if (measuredFront == closestDistance)
   {
     moveForward(SPEED_ATTACK);
     return;
   }
 
-  if (leftDetected)
+  if (measuredLeft == closestDistance)
   {
-    turnLeft(SPEED_ALIGN_TURN);
     moveDirection = MoveDirection::Left;
+
+    if (measuredFront < measureDistanceMin)
+    {
+      attackForwardLeft();
+    }
+    else
+    {
+      turnLeft(SPEED_ALIGN_TURN);
+    }
+
     return;
   }
 
-  if (rightDetected)
+  if (measuredRight == closestDistance)
   {
-    turnRight(SPEED_ALIGN_TURN);
     moveDirection = MoveDirection::Right;
+
+    if (measuredFront < measureDistanceMin)
+    {
+      attackForwardRight();
+    }
+    else
+    {
+      turnRight(SPEED_ALIGN_TURN);
+    }
+
     return;
   }
-
-  searchForOpponent();
 }
 
 void searchForOpponent()
