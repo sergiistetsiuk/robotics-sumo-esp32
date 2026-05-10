@@ -15,6 +15,8 @@ WebServer server(80);
 const uint8_t BTN_RUN_PIN = 4;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 const unsigned long SENSOR_LOG_INTERVAL_MS = 1000;
+const unsigned long START_SEQUENCE_INTERVAL_MS = 1000;
+const unsigned long START_SEQUENCE_DURATION_MS = 5000;
 const uint8_t WS2812B_PIN = 33;
 const uint8_t WS2812B_LED_COUNT = 3;
 const uint8_t I2C_SDA = 21;
@@ -31,7 +33,7 @@ const uint8_t MOTOR_RIGHT_PWM_PIN = 19;
 const uint8_t MOTOR_RIGHT_DIR_PIN = 18;
 const uint32_t pwmFreq = 5000;
 const uint8_t pwmResolution = 8;
-const uint8_t MOTOR_RUN_DUTY = 26;
+const uint8_t MOTOR_MAX_DUTY = 255;
 const uint8_t MOTOR_STOP_DUTY = 255;
 const uint8_t MOTOR_LEFT_PWM_CHANNEL = 0;
 const uint8_t MOTOR_RIGHT_PWM_CHANNEL = 1;
@@ -55,6 +57,9 @@ bool lastRunButtonReading = HIGH;
 bool stableRunButtonState = HIGH;
 unsigned long lastRunButtonChangeMs = 0;
 bool projectRunning = false;
+bool projectStarting = false;
+unsigned long startSequenceStartedMs = 0;
+int8_t lastStartSequenceStep = -1;
 unsigned long lastSensorLogMs = 0;
 bool sensorRightReady = false;
 bool sensorFrontReady = false;
@@ -78,10 +83,14 @@ String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready);
 void setupMotors();
 void attachMotorPwm(uint8_t pin, uint8_t channel);
 void writeMotorPwm(uint8_t pin, uint8_t channel, uint8_t duty);
+uint8_t speedPercentToDuty(uint8_t percent);
 void setMotorsSpeed(uint8_t duty);
+void setMotorsSpeedPercent(uint8_t percent);
 void setupLineSensor();
 String readLineSensorStatus();
 void setProjectRunning(bool running);
+void beginStartSequence();
+void updateStartSequence();
 void setupProject();
 void loopProject();
 
@@ -977,12 +986,24 @@ void writeMotorPwm(uint8_t pin, uint8_t channel, uint8_t duty)
 #endif
 }
 
+uint8_t speedPercentToDuty(uint8_t percent)
+{
+  const uint8_t limitedPercent = percent > 100 ? 100 : percent;
+
+  return (static_cast<uint16_t>(limitedPercent) * MOTOR_MAX_DUTY) / 100;
+}
+
 void setMotorsSpeed(uint8_t duty)
 {
   const uint8_t invertedDuty = MOTOR_STOP_DUTY - duty;
 
   writeMotorPwm(MOTOR_LEFT_PWM_PIN, MOTOR_LEFT_PWM_CHANNEL, invertedDuty);
   writeMotorPwm(MOTOR_RIGHT_PWM_PIN, MOTOR_RIGHT_PWM_CHANNEL, invertedDuty);
+}
+
+void setMotorsSpeedPercent(uint8_t percent)
+{
+  setMotorsSpeed(speedPercentToDuty(percent));
 }
 
 void setupLineSensor()
@@ -1003,6 +1024,7 @@ String readLineSensorStatus()
 
 void setProjectRunning(bool running)
 {
+  projectStarting = false;
   projectRunning = running;
 
   if (projectRunning)
@@ -1010,11 +1032,11 @@ void setProjectRunning(bool running)
     setWs2812bColor(255, 0, 0);
     digitalWrite(MOTOR_LEFT_DIR_PIN, HIGH);
     digitalWrite(MOTOR_RIGHT_DIR_PIN, HIGH);
-    setMotorsSpeed(MOTOR_RUN_DUTY);
+    setMotorsSpeedPercent(1);
     lastSensorLogMs = 0;
     addLog("Project status: running");
     addLog("WS2812B color: red");
-    addLog("Motors speed: 10% active-low PWM");
+    addLog("Motors speed: " + String(1) + "% active-low PWM");
   }
   else
   {
@@ -1025,6 +1047,53 @@ void setProjectRunning(bool running)
     addLog("Project status: stopped");
     addLog("WS2812B color: green");
     addLog("Motors stopped");
+  }
+}
+
+void beginStartSequence()
+{
+  setProjectRunning(false);
+  projectStarting = true;
+  startSequenceStartedMs = millis();
+  lastStartSequenceStep = -1;
+  addLog("Start sequence: 5 second red/green countdown");
+  updateStartSequence();
+}
+
+void updateStartSequence()
+{
+  if (!projectStarting)
+  {
+    return;
+  }
+
+  const unsigned long elapsedMs = millis() - startSequenceStartedMs;
+
+  if (elapsedMs >= START_SEQUENCE_DURATION_MS)
+  {
+    addLog("Start sequence complete");
+    setProjectRunning(true);
+    return;
+  }
+
+  const int8_t currentStep = elapsedMs / START_SEQUENCE_INTERVAL_MS;
+
+  if (currentStep == lastStartSequenceStep)
+  {
+    return;
+  }
+
+  lastStartSequenceStep = currentStep;
+
+  if (currentStep % 2 == 0)
+  {
+    setWs2812bColor(255, 0, 0);
+    addLog("Start sequence color: red");
+  }
+  else
+  {
+    setWs2812bColor(0, 255, 0);
+    addLog("Start sequence color: green");
   }
 }
 
@@ -1064,9 +1133,19 @@ void loopProject()
     if (stableRunButtonState == HIGH)
     {
       addLog("BTN_RUN_PIN released");
-      setProjectRunning(!projectRunning);
+
+      if (projectRunning || projectStarting)
+      {
+        setProjectRunning(false);
+      }
+      else
+      {
+        beginStartSequence();
+      }
     }
   }
+
+  updateStartSequence();
 
   if (projectRunning && (lastSensorLogMs == 0 || millis() - lastSensorLogMs >= SENSOR_LOG_INTERVAL_MS))
   {
