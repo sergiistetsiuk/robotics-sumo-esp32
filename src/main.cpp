@@ -33,6 +33,8 @@ const uint8_t MOTOR_RIGHT_PWM_PIN = 19;
 const uint8_t MOTOR_RIGHT_DIR_PIN = 18;
 const uint32_t pwmFreq = 5000;
 const uint8_t pwmResolution = 8;
+uint8_t searchSpeedPercent = 1;
+uint8_t attackSpeedPercent = 10;
 const uint8_t MOTOR_MAX_DUTY = 255;
 const uint8_t MOTOR_STOP_DUTY = 255;
 const uint8_t MOTOR_LEFT_PWM_CHANNEL = 0;
@@ -1032,11 +1034,11 @@ void setProjectRunning(bool running)
     setWs2812bColor(255, 0, 0);
     digitalWrite(MOTOR_LEFT_DIR_PIN, HIGH);
     digitalWrite(MOTOR_RIGHT_DIR_PIN, HIGH);
-    setMotorsSpeedPercent(1);
+    setMotorsSpeedPercent(searchSpeedPercent);
     lastSensorLogMs = 0;
     addLog("Project status: running");
     addLog("WS2812B color: red");
-    addLog("Motors speed: " + String(1) + "% active-low PWM");
+    addLog("Motors search speed: " + String(searchSpeedPercent) + "% active-low PWM");
   }
   else
   {
