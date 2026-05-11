@@ -55,7 +55,7 @@ const uint8_t MOTOR_RIGHT_PWM_CHANNEL = 1;
 const uint8_t LINE_SENSOR_PIN = 23;
 const uint8_t LINE_SENSOR_ACTIVE_STATE = HIGH;
 
-Adafruit_NeoPixel ws2812b(WS2812B_LED_COUNT, WS2812B_PIN, NEO_BRG + NEO_KHZ800);
+Adafruit_NeoPixel ws2812b(WS2812B_LED_COUNT, WS2812B_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_VL53L0X sensorRight;
 Adafruit_VL53L0X sensorFront;
 Adafruit_VL53L0X sensorLeft;
@@ -1202,9 +1202,6 @@ void setupProject()
   lastRunButtonReading = digitalRead(BTN_RUN_PIN);
   stableRunButtonState = lastRunButtonReading;
 
-  ws2812b.begin();
-  ws2812b.setBrightness(60);
-
   setupLineSensor();
   setupDistanceSensors();
   setProjectRunning(false);
@@ -1263,6 +1260,13 @@ void loopProject()
 void setup()
 {
   Serial.begin(115200);
+
+  ws2812b.begin();
+  ws2812b.setBrightness(40);
+
+  setWs2812bColor(255, 255, 0);
+  addLog("Running color: yellow");
+
   setupMotors();
   setupWiFi();
   setupWebOTA();
