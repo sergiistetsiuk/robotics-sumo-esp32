@@ -1084,38 +1084,27 @@ void runCombatAlgorithm()
   const bool leftDetected = leftDistanceMm <= OPPONENT_DETECT_DISTANCE_MM;
   const bool rightDetected = rightDistanceMm <= OPPONENT_DETECT_DISTANCE_MM;
 
-  if (frontDetected)
+  if (!frontDetected && !leftDetected && !rightDetected)
+  {
+    setMotorSpeeds(-SPEED_SEARCH_TURN, SPEED_SEARCH_TURN);
+    return;
+  }
+
+  const uint16_t smallestDistance = min(frontDistanceMm, min(leftDistanceMm, rightDistanceMm));
+
+  if (frontDistanceMm <= leftDistanceMm + DISTANCE_CLOSE_THRESHOLD_MM &&
+      frontDistanceMm <= rightDistanceMm + DISTANCE_CLOSE_THRESHOLD_MM)
   {
     setMotorSpeeds(SPEED_ATTACK, SPEED_ATTACK);
   }
-  else
+  else if (leftDistanceMm < rightDistanceMm)
   {
     setMotorSpeeds(0, SPEED_SEARCH_TURN);
   }
-
-  /*
-    if (!frontDetected && !leftDetected && !rightDetected)
-    {
-      setMotorSpeeds(-SPEED_SEARCH_TURN, SPEED_SEARCH_TURN);
-      return;
-    }
-
-    const uint16_t smallestDistance = min(frontDistanceMm, min(leftDistanceMm, rightDistanceMm));
-
-    if (frontDistanceMm <= leftDistanceMm + DISTANCE_CLOSE_THRESHOLD_MM &&
-        frontDistanceMm <= rightDistanceMm + DISTANCE_CLOSE_THRESHOLD_MM)
-    {
-      setMotorSpeeds(SPEED_ATTACK, SPEED_ATTACK);
-    }
-    else if (leftDistanceMm < rightDistanceMm)
-    {
-      setMotorSpeeds(0, SPEED_SEARCH_TURN);
-    }
-    else
-    {
-      setMotorSpeeds(SPEED_SEARCH_TURN, 0);
-    }
-      */
+  else
+  {
+    setMotorSpeeds(SPEED_SEARCH_TURN, 0);
+  }
 }
 
 void setupLineSensor()
