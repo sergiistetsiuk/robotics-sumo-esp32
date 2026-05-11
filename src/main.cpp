@@ -45,8 +45,11 @@ constexpr int16_t speedPercent(uint8_t percent)
 
 const int16_t SPEED_ATTACK = speedPercent(10);
 const int16_t SPEED_SEARCH_TURN = speedPercent(7);
-const uint16_t OPPONENT_DETECT_DISTANCE_MM = 500;
+const uint16_t OPPONENT_DETECT_DISTANCE_MM = 400;
+const uint16_t DISTANCE_CLOSE_THRESHOLD_MM = 80;
 const uint16_t DISTANCE_INVALID_MM = 8191;
+const uint16_t DISTANCE_SENSOR_PERIOD_MS = 20;
+const uint32_t DISTANCE_SENSOR_TIMING_BUDGET_US = 20000;
 const uint8_t MOTOR_LEFT_PWM_CHANNEL = 0;
 const uint8_t MOTOR_RIGHT_PWM_CHANNEL = 1;
 const uint8_t LINE_SENSOR_PIN = 23;
@@ -76,6 +79,9 @@ unsigned long lastSensorLogMs = 0;
 bool sensorRightReady = false;
 bool sensorFrontReady = false;
 bool sensorLeftReady = false;
+uint16_t rightDistanceMm = DISTANCE_INVALID_MM;
+uint16_t frontDistanceMm = DISTANCE_INVALID_MM;
+uint16_t leftDistanceMm = DISTANCE_INVALID_MM;
 
 void setupWiFi();
 void setupWebOTA();
@@ -90,9 +96,10 @@ void handleFirmwareUpload();
 void setWs2812bColor(uint8_t red, uint8_t green, uint8_t blue);
 void setupDistanceSensors();
 bool setupDistanceSensor(Adafruit_VL53L0X &sensor, const String &name, uint8_t xshutPin, uint8_t address);
+void updateDistanceSensors();
+void updateDistanceSensor(Adafruit_VL53L0X &sensor, bool ready, uint16_t &distanceMm);
 void logDistanceSensors();
-uint16_t readDistanceSensorMm(Adafruit_VL53L0X &sensor, bool ready);
-String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready);
+String formatDistanceSensor(uint16_t distanceMm, bool ready);
 void setupMotors();
 void attachMotorPwm(uint8_t pin, uint8_t channel);
 void writeMotorPwm(uint8_t pin, uint8_t channel, uint8_t duty);
@@ -931,32 +938,47 @@ bool setupDistanceSensor(Adafruit_VL53L0X &sensor, const String &name, uint8_t x
     return false;
   }
 
+  sensor.setMeasurementTimingBudgetMicroSeconds(DISTANCE_SENSOR_TIMING_BUDGET_US);
+  sensor.startRangeContinuous(DISTANCE_SENSOR_PERIOD_MS);
+
   addLog("VL53L0X " + name + " initialized at address 0x" + String(address, HEX));
   return true;
 }
 
-uint16_t readDistanceSensorMm(Adafruit_VL53L0X &sensor, bool ready)
+void updateDistanceSensor(Adafruit_VL53L0X &sensor, bool ready, uint16_t &distanceMm)
 {
   if (!ready)
   {
-    return DISTANCE_INVALID_MM;
+    distanceMm = DISTANCE_INVALID_MM;
+    return;
   }
 
-  VL53L0X_RangingMeasurementData_t measurement;
-  sensor.rangingTest(&measurement, false);
-
-  if (measurement.RangeStatus == 4)
+  if (!sensor.isRangeComplete())
   {
-    return DISTANCE_INVALID_MM;
+    return;
   }
 
-  return measurement.RangeMilliMeter;
+  const uint16_t measuredDistanceMm = sensor.readRangeResult();
+  const uint8_t rangeStatus = sensor.readRangeStatus();
+
+  if (rangeStatus == 4)
+  {
+    distanceMm = DISTANCE_INVALID_MM;
+    return;
+  }
+
+  distanceMm = measuredDistanceMm;
 }
 
-String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready)
+void updateDistanceSensors()
 {
-  const uint16_t distanceMm = readDistanceSensorMm(sensor, ready);
+  updateDistanceSensor(sensorFront, sensorFrontReady, frontDistanceMm);
+  updateDistanceSensor(sensorLeft, sensorLeftReady, leftDistanceMm);
+  updateDistanceSensor(sensorRight, sensorRightReady, rightDistanceMm);
+}
 
+String formatDistanceSensor(uint16_t distanceMm, bool ready)
+{
   if (!ready)
   {
     return "not ready";
@@ -972,9 +994,11 @@ String readDistanceSensor(Adafruit_VL53L0X &sensor, bool ready)
 
 void logDistanceSensors()
 {
-  const String rightValue = readDistanceSensor(sensorRight, sensorRightReady);
-  const String frontValue = readDistanceSensor(sensorFront, sensorFrontReady);
-  const String leftValue = readDistanceSensor(sensorLeft, sensorLeftReady);
+  updateDistanceSensors();
+
+  const String rightValue = formatDistanceSensor(rightDistanceMm, sensorRightReady);
+  const String frontValue = formatDistanceSensor(frontDistanceMm, sensorFrontReady);
+  const String leftValue = formatDistanceSensor(leftDistanceMm, sensorLeftReady);
 
   addLog("VL53L0X distances - left: " + leftValue + ", front: " + frontValue + ", right: " + rightValue);
   addLog("Line sensor status: " + readLineSensorStatus());
@@ -1054,34 +1078,44 @@ void setMotorSpeeds(int16_t leftSpeed, int16_t rightSpeed)
 
 void runCombatAlgorithm()
 {
-  const uint16_t frontDistance = readDistanceSensorMm(sensorFront, sensorFrontReady);
-  const uint16_t leftDistance = readDistanceSensorMm(sensorLeft, sensorLeftReady);
-  const uint16_t rightDistance = readDistanceSensorMm(sensorRight, sensorRightReady);
+  updateDistanceSensors();
 
-  const bool frontDetected = frontDistance <= OPPONENT_DETECT_DISTANCE_MM;
-  const bool leftDetected = leftDistance <= OPPONENT_DETECT_DISTANCE_MM;
-  const bool rightDetected = rightDistance <= OPPONENT_DETECT_DISTANCE_MM;
+  const bool frontDetected = frontDistanceMm <= OPPONENT_DETECT_DISTANCE_MM;
+  const bool leftDetected = leftDistanceMm <= OPPONENT_DETECT_DISTANCE_MM;
+  const bool rightDetected = rightDistanceMm <= OPPONENT_DETECT_DISTANCE_MM;
 
-  if (!frontDetected && !leftDetected && !rightDetected)
-  {
-    setMotorSpeeds(-SPEED_SEARCH_TURN, SPEED_SEARCH_TURN);
-    return;
-  }
-
-  const uint16_t smallestDistance = min(frontDistance, min(leftDistance, rightDistance));
-
-  if (frontDistance == smallestDistance)
+  if (frontDetected)
   {
     setMotorSpeeds(SPEED_ATTACK, SPEED_ATTACK);
   }
-  else if (leftDistance == smallestDistance)
-  {
-    setMotorSpeeds(-SPEED_SEARCH_TURN, SPEED_SEARCH_TURN);
-  }
   else
   {
-    setMotorSpeeds(SPEED_SEARCH_TURN, -SPEED_SEARCH_TURN);
+    setMotorSpeeds(0, SPEED_SEARCH_TURN);
   }
+
+  /*
+    if (!frontDetected && !leftDetected && !rightDetected)
+    {
+      setMotorSpeeds(-SPEED_SEARCH_TURN, SPEED_SEARCH_TURN);
+      return;
+    }
+
+    const uint16_t smallestDistance = min(frontDistanceMm, min(leftDistanceMm, rightDistanceMm));
+
+    if (frontDistanceMm <= leftDistanceMm + DISTANCE_CLOSE_THRESHOLD_MM &&
+        frontDistanceMm <= rightDistanceMm + DISTANCE_CLOSE_THRESHOLD_MM)
+    {
+      setMotorSpeeds(SPEED_ATTACK, SPEED_ATTACK);
+    }
+    else if (leftDistanceMm < rightDistanceMm)
+    {
+      setMotorSpeeds(0, SPEED_SEARCH_TURN);
+    }
+    else
+    {
+      setMotorSpeeds(SPEED_SEARCH_TURN, 0);
+    }
+      */
 }
 
 void setupLineSensor()
